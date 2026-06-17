@@ -1,0 +1,215 @@
+name: Example CI/CD Pipeline
+version: "1.0"
+description: A comprehensive example demonstrating all pipeline features
+timeout: 3600
+failure_strategy: abort
+triggers:
+  - manual
+  - push
+
+variables:
+  - key: APP_NAME
+    value: myapp
+    description: Application name
+  - key: BUILD_VERSION
+    value: "1.0.0"
+    description: Build version
+  - key: NODE_ENV
+    value: production
+  - key: RUN_TESTS
+    value: "true"
+  - key: DEPLOY_ENV
+    value: staging
+
+stages:
+  - name: setup
+    description: Initialize environment and prepare workspace
+    parallel: false
+    steps:
+      - name: check_env
+        description: Check runtime environment
+        script:
+          - echo "Checking environment..."
+          - echo "Operating System=$($(uname -s 2>/dev/null || echo %OS%))"
+          - echo "Python version=$(python --version 2>&1 || python3 --version 2>&1)"
+          - echo "::set-output name=env_checked::true"
+        timeout: 60
+
+      - name: prepare_dirs
+        description: Create working directories
+        script:
+          - echo "Creating directories..."
+          - mkdir -p build dist logs reports 2>$null || mkdir build dist logs reports 2>nul || echo "Using current dir"
+          - echo "::set-output name=dirs_ready::true"
+        depends_on:
+          - check_env
+
+  - name: build
+    description: Build the application
+    parallel: true
+    depends_on:
+      - setup
+    steps:
+      - name: compile_code
+        description: Compile source code
+        script:
+          - echo "Compiling $APP_NAME version $BUILD_VERSION..."
+          - echo "Build started at $(date 2>/dev/null || echo %DATE%)"
+          - echo "const version = '$BUILD_VERSION';" > build/version.txt || echo version=$BUILD_VERSION > build/version.txt
+          - echo "Compile output" > build/output.txt
+          - echo "Build completed successfully"
+          - echo "::set-output name=build_success::true"
+          - echo "::set-output name=build_id::build-$(date +%s 2>/dev/null || echo %RANDOM%)"
+        artifacts_out:
+          - name: build_output
+            source_path: build
+            description: Compiled build artifacts
+            retention_days: 30
+            compressed: true
+        timeout: 300
+        retries: 2
+        retry_delay: 10
+
+      - name: generate_docs
+        description: Generate documentation
+        script:
+          - echo "Generating documentation for $APP_NAME..."
+          - echo "# $APP_NAME Documentation" > docs/README.md || echo docs will not be generated > build/dummy.txt
+          - echo "Version: $BUILD_VERSION" >> docs/README.md 2>$null || echo done
+          - echo "Docs generated"
+        allow_failure: true
+        artifacts_out:
+          - name: documentation
+            source_path: docs
+            description: Generated documentation
+            compressed: true
+            retention_days: 7
+
+  - name: test
+    description: Run test suite
+    depends_on:
+      - build
+    condition:
+      variable: RUN_TESTS
+      operator: eq
+      value: "true"
+    steps:
+      - name: unit_tests
+        description: Run unit tests
+        script:
+          - echo "Running unit tests..."
+          - echo "Test 1: PASS"
+          - echo "Test 2: PASS"
+          - echo "Test 3: PASS"
+          - echo "All unit tests passed!"
+          - echo "3 tests, 0 failures" > reports/unit.txt || mkdir -p reports && echo "3 tests, 0 failures" > reports/unit.txt
+          - echo "::set-output name=test_count::3"
+          - echo "::set-output name=failures::0"
+        artifacts_in:
+          - build_output
+        artifacts_out:
+          - name: test_reports
+            source_path: reports
+            description: Test execution reports
+            compressed: true
+        timeout: 600
+
+      - name: integration_tests
+        description: Run integration tests
+        script:
+          - echo "Running integration tests..."
+          - echo "Integration Test 1: PASS"
+          - echo "Integration Test 2: PASS"
+          - echo "All integration tests passed!"
+          - echo "::set-output name=integration_ok::true"
+        depends_on:
+          - unit_tests
+        retries: 1
+
+  - name: package
+    description: Package application for distribution
+    depends_on:
+      - test
+    steps:
+      - name: create_dist
+        description: Create distribution package
+        script:
+          - echo "Creating distribution package..."
+          - echo "Packaging $APP_NAME $BUILD_VERSION for $DEPLOY_ENV"
+          - mkdir -p dist 2>$null || mkdir dist 2>nul || echo "dist exists"
+          - echo "$APP_NAME-$BUILD_VERSION.tar.gz contents" > dist/package.txt
+          - echo "Package created: $APP_NAME-$BUILD_VERSION.tar.gz"
+          - echo "::set-output name=package_name::$APP_NAME-$BUILD_VERSION.tar.gz"
+          - echo "::set-output name=package_size::1024"
+        artifacts_in:
+          - build_output
+          - test_reports
+        artifacts_out:
+          - name: dist_package
+            source_path: dist
+            description: Final distribution package
+            compressed: true
+            retention_days: 90
+        timeout: 120
+
+  - name: deploy
+    description: Deploy to target environment
+    depends_on:
+      - package
+    failure_strategy: continue
+    condition:
+      expression: "DEPLOY_ENV in ['staging', 'production']"
+    steps:
+      - name: deploy_staging
+        description: Deploy to staging environment
+        script:
+          - echo "Deploying $APP_NAME $BUILD_VERSION to $DEPLOY_ENV..."
+          - echo "Deployed successfully to staging"
+          - echo "Application URL: http://staging.$APP_NAME.example.com"
+          - echo "::set-output name=deploy_url::http://staging.$APP_NAME.example.com"
+        artifacts_in:
+          - dist_package
+        condition:
+          variable: DEPLOY_ENV
+          operator: eq
+          value: staging
+
+      - name: deploy_production
+        description: Deploy to production environment
+        script:
+          - echo "Deploying $APP_NAME $BUILD_VERSION to PRODUCTION..."
+          - echo "Running pre-deploy checks..."
+          - echo "Production deployment successful"
+          - echo "Application URL: https://$APP_NAME.example.com"
+          - echo "::set-output name=deploy_url::https://$APP_NAME.example.com"
+        artifacts_in:
+          - dist_package
+        condition:
+          variable: DEPLOY_ENV
+          operator: eq
+          value: production
+        allow_failure: true
+        retries: 3
+        retry_delay: 30
+
+  - name: notify
+    description: Send notifications
+    depends_on:
+      - deploy
+    parallel: true
+    failure_strategy: continue
+    steps:
+      - name: send_email
+        description: Send email notification
+        script:
+          - echo "Sending email notification..."
+          - echo "Pipeline completed - $APP_NAME $BUILD_VERSION"
+          - echo "Notification sent to team@example.com"
+
+      - name: send_slack
+        description: Send Slack notification
+        script:
+          - echo "Sending Slack notification..."
+          - echo ":white_check_mark: Pipeline completed: $APP_NAME $BUILD_VERSION"
+          - echo "Status: SUCCESS"
+        allow_failure: true
