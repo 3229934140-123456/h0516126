@@ -38,10 +38,10 @@ class StatusAggregator:
             for s in statuses
         )
         has_success = any(s == StepStatus.SUCCESS for s in statuses)
-        if has_failure and has_success:
-            return StepStatus.SUCCESS
         if has_failure:
             return StepStatus.FAILED
+        if has_success or all(s == StepStatus.SKIPPED for s in statuses):
+            return StepStatus.SUCCESS
         if all(s == StepStatus.PENDING for s in statuses):
             return StepStatus.PENDING
         return StepStatus.PENDING

@@ -756,17 +756,38 @@ class PipelineScheduler:
         self, ctx: ExecutionContext, all_nodes: Set[str], processed: Set[str]
     ) -> None:
         self._log(ctx, "Pipeline aborted by user", LogLevel.WARN)
+        now = time.time()
+        state = self.state_manager.get_state(ctx.pipeline_id)
         for node_key in all_nodes - processed:
             node = ctx._node_key_step_map.get(node_key)
             if node:
                 stage, step = node
                 if step is None:
+                    stage_start = None
+                    if state:
+                        stage_state = state.stage_states.get(stage.name, {})
+                        stage_start = stage_state.get("start_time")
                     self.state_manager.update_stage(
-                        ctx.pipeline_id, stage.name, StepStatus.CANCELLED
+                        ctx.pipeline_id,
+                        stage.name,
+                        StepStatus.CANCELLED,
+                        start_time=stage_start or now,
+                        end_time=now,
                     )
                 else:
+                    step_start = None
+                    if state:
+                        step_state = state.step_states.get(
+                            f"{stage.name}:{step.name}", {}
+                        )
+                        step_start = step_state.get("start_time")
                     self.state_manager.update_step(
-                        ctx.pipeline_id, stage.name, step.name, StepStatus.CANCELLED
+                        ctx.pipeline_id,
+                        stage.name,
+                        step.name,
+                        StepStatus.CANCELLED,
+                        start_time=step_start or now,
+                        end_time=now,
                     )
                     ctx.skipped_nodes.add(node_key)
             processed.add(node_key)
@@ -775,21 +796,39 @@ class PipelineScheduler:
         self, ctx: ExecutionContext, all_nodes: Set[str], processed: Set[str]
     ) -> None:
         self._log(ctx, "Pipeline timed out", LogLevel.ERROR)
+        now = time.time()
+        state = self.state_manager.get_state(ctx.pipeline_id)
         for node_key in all_nodes - processed:
             node = ctx._node_key_step_map.get(node_key)
             if node:
                 stage, step = node
                 if step is None:
+                    stage_start = None
+                    if state:
+                        stage_state = state.stage_states.get(stage.name, {})
+                        stage_start = stage_state.get("start_time")
                     self.state_manager.update_stage(
-                        ctx.pipeline_id, stage.name, StepStatus.CANCELLED
+                        ctx.pipeline_id,
+                        stage.name,
+                        StepStatus.CANCELLED,
+                        start_time=stage_start or now,
+                        end_time=now,
                     )
                 else:
+                    step_start = None
+                    if state:
+                        step_state = state.step_states.get(
+                            f"{stage.name}:{step.name}", {}
+                        )
+                        step_start = step_state.get("start_time")
                     self.state_manager.update_step(
                         ctx.pipeline_id,
                         stage.name,
                         step.name,
                         StepStatus.TIMEOUT,
                         error_message="Pipeline timeout",
+                        start_time=step_start or now,
+                        end_time=now,
                     )
                     ctx.failed_nodes.add(node_key)
             processed.add(node_key)
@@ -798,17 +837,38 @@ class PipelineScheduler:
         self, ctx: ExecutionContext, all_nodes: Set[str], processed: Set[str]
     ) -> None:
         self._log(ctx, "Aborting pipeline due to failure (strategy: ABORT)", LogLevel.WARN)
+        now = time.time()
+        state = self.state_manager.get_state(ctx.pipeline_id)
         for node_key in all_nodes - processed:
             node = ctx._node_key_step_map.get(node_key)
             if node:
                 stage, step = node
                 if step is None:
+                    stage_start = None
+                    if state:
+                        stage_state = state.stage_states.get(stage.name, {})
+                        stage_start = stage_state.get("start_time")
                     self.state_manager.update_stage(
-                        ctx.pipeline_id, stage.name, StepStatus.CANCELLED
+                        ctx.pipeline_id,
+                        stage.name,
+                        StepStatus.CANCELLED,
+                        start_time=stage_start or now,
+                        end_time=now,
                     )
                 else:
+                    step_start = None
+                    if state:
+                        step_state = state.step_states.get(
+                            f"{stage.name}:{step.name}", {}
+                        )
+                        step_start = step_state.get("start_time")
                     self.state_manager.update_step(
-                        ctx.pipeline_id, stage.name, step.name, StepStatus.SKIPPED
+                        ctx.pipeline_id,
+                        stage.name,
+                        step.name,
+                        StepStatus.SKIPPED,
+                        start_time=step_start or now,
+                        end_time=now,
                     )
                     ctx.skipped_nodes.add(node_key)
             processed.add(node_key)
@@ -843,9 +903,23 @@ class PipelineScheduler:
     ) -> bool:
         if ctx.is_aborted():
             ctx.running_nodes.discard(node_key)
+            now = time.time()
             self.state_manager.update_stage(
-                ctx.pipeline_id, stage.name, StepStatus.CANCELLED
+                ctx.pipeline_id,
+                stage.name,
+                StepStatus.CANCELLED,
+                start_time=now,
+                end_time=now,
             )
+            for step in stage.steps:
+                self.state_manager.update_step(
+                    ctx.pipeline_id,
+                    stage.name,
+                    step.name,
+                    StepStatus.CANCELLED,
+                    start_time=now,
+                    end_time=now,
+                )
             return True
 
         stage_start = time.time()
