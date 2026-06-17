@@ -149,6 +149,7 @@ class ExecutionEnvironment(abc.ABC):
         combined_output_vars: Dict[str, Any] = {}
         last_exit_code = 0
         last_error: Optional[str] = None
+        timed_out = False
 
         per_cmd_timeout = max(1, timeout // max(1, len(commands)))
 
@@ -170,6 +171,9 @@ class ExecutionEnvironment(abc.ABC):
             combined_output_vars.update(result.output_variables)
             self.add_envs(result.output_variables.get("__env_export__", {}))
 
+            if result.timeout:
+                timed_out = True
+
             if not result.success:
                 last_exit_code = result.exit_code
                 last_error = result.error_message or f"Command failed: {cmd}"
@@ -187,7 +191,7 @@ class ExecutionEnvironment(abc.ABC):
             stderr="\n".join(combined_stderr),
             start_time=start_time,
             end_time=end_time,
-            timeout=False,
+            timeout=timed_out,
             error_message=last_error,
             output_variables=combined_output_vars,
         )
@@ -298,16 +302,26 @@ class SubprocessEnvironment(ExecutionEnvironment):
                     pass
 
         try:
+            popen_kwargs = {
+                "shell": use_shell,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "cwd": self.working_dir,
+                "env": {**os.environ, **self.env_vars},
+                "text": True,
+                "bufsize": 1,
+                "universal_newlines": True,
+            }
+            system = platform.system()
+            if system != "Windows":
+                popen_kwargs["start_new_session"] = True
+            else:
+                if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
             process = subprocess.Popen(
                 cmd_args if not use_shell else resolved_cmd,
-                shell=use_shell,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=self.working_dir,
-                env={**os.environ, **self.env_vars},
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
+                **popen_kwargs,
             )
 
             with self._process_lock:
@@ -386,30 +400,163 @@ class SubprocessEnvironment(ExecutionEnvironment):
             output_variables=output_vars,
         )
 
-    def _kill_process(self, process: subprocess.Popen) -> None:
+    def _get_child_pids(self, parent_pid: int) -> List[int]:
+        children: List[int] = []
         try:
-            if platform.system() == "Windows":
-                process.terminate()
+            system = platform.system()
+            if system == "Windows":
                 try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    result = subprocess.run(
+                        [
+                            "wmic",
+                            "process",
+                            "where",
+                            f"ParentProcessId={parent_pid}",
+                            "get",
+                            "ProcessId",
+                            "/FORMAT:LIST",
+                        ],
                         capture_output=True,
+                        text=True,
+                        timeout=5,
                     )
-            else:
-                pgid = os.getpgid(process.pid) if hasattr(os, "getpgid") else process.pid
-                try:
-                    os.killpg(pgid, signal.SIGTERM)
-                except (ProcessLookupError, AttributeError, PermissionError):
-                    process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
+                    if result.returncode == 0:
+                        for line in result.stdout.split("\n"):
+                            line = line.strip()
+                            if line.startswith("ProcessId="):
+                                try:
+                                    pid = int(line.split("=", 1)[1].strip())
+                                    if pid != parent_pid:
+                                        children.append(pid)
+                                        children.extend(self._get_child_pids(pid))
+                                except (ValueError, TypeError):
+                                    pass
+                except Exception:
                     try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except (ProcessLookupError, AttributeError, PermissionError):
+                        result = subprocess.run(
+                            ["tasklist", "/S", "/FI", f"PPID eq {parent_pid}", "/FO", "CSV", "/NH"],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        if result.returncode == 0:
+                            import csv
+                            reader = csv.reader(result.stdout.splitlines())
+                            for row in reader:
+                                if len(row) >= 2:
+                                    try:
+                                        pid = int(row[1].strip())
+                                        if pid != parent_pid:
+                                            children.append(pid)
+                                            children.extend(self._get_child_pids(pid))
+                                    except (ValueError, TypeError):
+                                        pass
+                    except Exception:
+                        pass
+            else:
+                try:
+                    result = subprocess.run(
+                        ["pgrep", "-P", str(parent_pid)],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode == 0:
+                        for line in result.stdout.split("\n"):
+                            line = line.strip()
+                            if line and line.isdigit():
+                                child_pid = int(line)
+                                if child_pid != parent_pid:
+                                    children.append(child_pid)
+                                    children.extend(self._get_child_pids(child_pid))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return children
+
+    def _kill_pid_safe(self, pid: int, sig: int = None) -> None:
+        if pid <= 0:
+            return
+        try:
+            import os as _os
+            import signal as _signal
+            _os.kill(pid, sig or _signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError, AttributeError):
+            pass
+
+    def _kill_process(self, process: subprocess.Popen) -> None:
+        if process is None:
+            return
+
+        pid = process.pid
+        if pid is None or pid <= 0:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            return
+
+        try:
+            system = platform.system()
+            child_pids = self._get_child_pids(pid)
+
+            try:
+                import psutil
+                has_psutil = True
+            except ImportError:
+                has_psutil = False
+
+            if has_psutil:
+                try:
+                    parent = psutil.Process(pid)
+                    all_children = parent.children(recursive=True)
+                    all_pids = [p.pid for p in all_children] + [pid]
+                except Exception:
+                    all_pids = list(reversed(child_pids)) + [pid]
+            else:
+                all_pids = list(reversed(child_pids)) + [pid]
+
+            unique_pids = []
+            seen = set()
+            for p in all_pids:
+                if p not in seen and p > 0:
+                    seen.add(p)
+                    unique_pids.append(p)
+
+            for target_pid in unique_pids:
+                try:
+                    if target_pid == pid:
+                        try:
+                            process.terminate()
+                        except Exception:
+                            self._kill_pid_safe(target_pid)
+                    else:
+                        self._kill_pid_safe(target_pid)
+                except Exception:
+                    pass
+
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+
+            if system == "Windows":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True,
+                        timeout=3,
+                    )
+                except Exception:
+                    try:
                         process.kill()
+                    except Exception:
+                        pass
+            else:
+                for target_pid in reversed(unique_pids):
+                    self._kill_pid_safe(target_pid, signal.SIGKILL)
+
         except Exception:
             try:
                 process.kill()

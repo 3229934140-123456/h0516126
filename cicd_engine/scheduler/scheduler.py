@@ -292,14 +292,45 @@ class PipelineScheduler:
 
         pipeline_end = time.time()
         result = self.state_manager.get_result(ctx.pipeline_id)
-        if result:
+        state = self.state_manager.get_state(ctx.pipeline_id)
+        if result and state:
             final_status = result.status
+            if not state.end_time:
+                state.end_time = pipeline_end
+                self.state_manager.update_pipeline(
+                    ctx.pipeline_id,
+                    final_status,
+                    end_time=pipeline_end,
+                )
+        elif result:
+            final_status = result.status
+            state = self.state_manager.get_state(ctx.pipeline_id)
+            if state and not state.end_time:
+                state.end_time = pipeline_end
+                self.state_manager.update_pipeline(
+                    ctx.pipeline_id,
+                    final_status,
+                    end_time=pipeline_end,
+                )
         else:
             final_state = self.state_manager.get_state(ctx.pipeline_id)
             if final_state:
                 final_status = final_state.status
+                if not final_state.end_time:
+                    final_state.end_time = pipeline_end
+                    self.state_manager.update_pipeline(
+                        ctx.pipeline_id,
+                        final_status,
+                        end_time=pipeline_end,
+                    )
             else:
                 final_status = PipelineStatus.SUCCESS
+                self.state_manager.update_pipeline(
+                    ctx.pipeline_id,
+                    final_status,
+                    start_time=pipeline_start,
+                    end_time=pipeline_end,
+                )
 
         if final_status in (PipelineStatus.RUNNING, PipelineStatus.PENDING, PipelineStatus.PAUSED):
             state = self.state_manager.get_state(ctx.pipeline_id)
@@ -485,6 +516,8 @@ class PipelineScheduler:
 
                 running_step_keys = {futures[f] for f in futures}
                 ready_steps = []
+                skipped_due_to_upstream: List[str] = []
+
                 for step_key in step_node_keys:
                     if step_key in processed_steps or step_key in running_step_keys:
                         continue
@@ -498,25 +531,87 @@ class PipelineScheduler:
                     stage_node_of_step = f"stage:{stage_.name}"
                     if stage_node_of_step not in started_stages:
                         continue
+
                     deps = graph.get_dependencies(step_key)
                     all_ready = True
-                    if not deps:
-                        pass
-                    else:
+                    has_failed_dep = False
+                    failed_dep_name = None
+
+                    if deps:
                         for dep in deps:
                             if dep.startswith("stage:"):
+                                dep_stage_name = dep[len("stage:"):]
+                                dep_stage = ctx.pipeline.get_stage(dep_stage_name)
+                                stage_failed = False
+                                if dep_stage:
+                                    dep_state = self.state_manager.get_state(ctx.pipeline_id)
+                                    if dep_state:
+                                        dep_status = dep_state.get_stage_status(dep_stage_name)
+                                        if dep_status and dep_status in (StepStatus.FAILED, StepStatus.TIMEOUT):
+                                            stage_failed = True
+                                if stage_failed:
+                                    has_failed_dep = True
+                                    failed_dep_name = dep_stage_name
+                                    break
+
                                 if dep not in processed_stages:
                                     all_ready = False
                                     break
-                            else:
-                                if dep not in processed_steps and dep not in ctx.skipped_nodes \
-                                   and dep not in ctx.completed_nodes:
-                                    if dep in ctx.failed_nodes:
-                                        continue
-                                    all_ready = False
-                                    break
+                                continue
+
+                            if dep in ctx.failed_nodes:
+                                _, dep_step = ctx._node_key_step_map.get(dep, (None, None))
+                                if dep_step and dep_step.allow_failure:
+                                    continue
+                                has_failed_dep = True
+                                failed_dep_name = dep
+                                break
+
+                            if dep in processed_steps or dep in ctx.skipped_nodes or dep in ctx.completed_nodes:
+                                continue
+
+                            all_ready = False
+                            break
+
+                    if has_failed_dep:
+                        skipped_due_to_upstream.append((step_key, failed_dep_name))
+                        continue
+
                     if all_ready:
                         ready_steps.append(step_key)
+
+                for step_key, failed_dep in skipped_due_to_upstream:
+                    ctx.skipped_nodes.add(step_key)
+                    processed_steps.add(step_key)
+                    _, step = ctx._node_key_step_map.get(step_key, (None, None))
+                    stage_name = step_key.split(":", 2)[1]
+                    step_name = step_key.split(":", 2)[2]
+                    error_msg = f"Skipped due to upstream failure: {failed_dep}"
+                    self._log(
+                        ctx,
+                        f"Step '{step_name}' skipped: {error_msg}",
+                        LogLevel.WARN,
+                        stage_name=stage_name,
+                        step_name=step_name,
+                    )
+                    self.state_manager.update_step(
+                        ctx.pipeline_id,
+                        stage_name,
+                        step_name,
+                        StepStatus.SKIPPED,
+                        error_message=error_msg,
+                        start_time=time.time(),
+                        end_time=time.time(),
+                    )
+                    self._emit_event(
+                        SchedulerEvent(
+                            type=SchedulerEventType.STEP_SKIPPED,
+                            pipeline_id=ctx.pipeline_id,
+                            stage_name=stage_name,
+                            step_name=step_name,
+                            message=error_msg,
+                        )
+                    )
 
                 for step_key in ready_steps:
                     if step_key in processed_steps or step_key in running_step_keys:
@@ -539,6 +634,8 @@ class PipelineScheduler:
                     remaining = step_node_keys - processed_steps - ctx.skipped_nodes
                     if remaining:
                         any_ready = False
+                        upstream_skip: List[tuple] = []
+                        pending_stage_steps = False
                         for step_key in remaining:
                             stage_, step_ = ctx._node_key_step_map.get(step_key, (None, None))
                             if not stage_ or not step_:
@@ -546,45 +643,95 @@ class PipelineScheduler:
                                 continue
                             stage_node_of_step = f"stage:{stage_.name}"
                             if stage_node_of_step not in started_stages:
+                                pending_stage_steps = True
                                 continue
                             deps = graph.get_dependencies(step_key)
                             all_ready = True
+                            has_failed_dep = False
+                            failed_dep_name = None
                             if deps:
                                 for dep in deps:
                                     if dep.startswith("stage:"):
+                                        dep_stage_name = dep[len("stage:"):]
+                                        dep_stage = ctx.pipeline.get_stage(dep_stage_name)
+                                        stage_failed = False
+                                        if dep_stage:
+                                            dep_state = self.state_manager.get_state(ctx.pipeline_id)
+                                            if dep_state:
+                                                dep_status = dep_state.get_stage_status(dep_stage_name)
+                                                if dep_status and dep_status in (StepStatus.FAILED, StepStatus.TIMEOUT):
+                                                    stage_failed = True
+                                        if stage_failed:
+                                            has_failed_dep = True
+                                            failed_dep_name = dep_stage_name
+                                            break
+
                                         if dep not in processed_stages:
                                             all_ready = False
                                             break
-                                    else:
-                                        if dep not in processed_steps and dep not in ctx.skipped_nodes \
-                                           and dep not in ctx.completed_nodes \
-                                           and dep not in ctx.failed_nodes:
-                                            all_ready = False
-                                            break
+                                        continue
+                                    if dep in ctx.failed_nodes:
+                                        _, dep_step = ctx._node_key_step_map.get(dep, (None, None))
+                                        if dep_step and dep_step.allow_failure:
+                                            continue
+                                        has_failed_dep = True
+                                        failed_dep_name = dep
+                                        break
+                                    if dep in processed_steps or dep in ctx.skipped_nodes or dep in ctx.completed_nodes:
+                                        continue
+                                    all_ready = False
+                                    break
+                            if has_failed_dep:
+                                upstream_skip.append((step_key, failed_dep_name))
+                                continue
                             if all_ready:
                                 any_ready = True
                                 break
-                        if not any_ready:
+                        if upstream_skip:
+                            for step_key, failed_dep in upstream_skip:
+                                ctx.skipped_nodes.add(step_key)
+                                processed_steps.add(step_key)
+                                _, step = ctx._node_key_step_map.get(step_key, (None, None))
+                                stage_name = step_key.split(":", 2)[1]
+                                step_name = step_key.split(":", 2)[2]
+                                error_msg = f"Skipped due to upstream failure: {failed_dep}"
+                                self._log(
+                                    ctx,
+                                    f"Step '{step_name}' skipped: {error_msg}",
+                                    LogLevel.WARN,
+                                    stage_name=stage_name,
+                                    step_name=step_name,
+                                )
+                                self.state_manager.update_step(
+                                    ctx.pipeline_id,
+                                    stage_name,
+                                    step_name,
+                                    StepStatus.SKIPPED,
+                                    error_message=error_msg,
+                                    start_time=time.time(),
+                                    end_time=time.time(),
+                                )
+                        elif not any_ready and not pending_stage_steps:
                             self._log(
                                 ctx,
                                 f"Cannot proceed with remaining steps: {remaining}",
                                 LogLevel.WARN,
                             )
                             for step_key in remaining:
+                                if step_key in ctx.skipped_nodes:
+                                    continue
                                 ctx.skipped_nodes.add(step_key)
                                 processed_steps.add(step_key)
                                 _, step = ctx._node_key_step_map.get(step_key, (None, None))
                                 stage_name = step_key.split(":", 2)[1]
                                 step_name = step_key.split(":", 2)[2]
-                                if step and step.allow_failure:
-                                    self.state_manager.update_step(
-                                        ctx.pipeline_id, stage_name, step_name, StepStatus.SKIPPED
-                                    )
-                                else:
-                                    self.state_manager.update_step(
-                                        ctx.pipeline_id, stage_name, step_name, StepStatus.SKIPPED,
-                                        error_message="Cannot resolve dependencies"
-                                    )
+                                error_msg = "Cannot resolve dependencies"
+                                self.state_manager.update_step(
+                                    ctx.pipeline_id, stage_name, step_name, StepStatus.SKIPPED,
+                                    error_message=error_msg,
+                                    start_time=time.time(),
+                                    end_time=time.time(),
+                                )
 
                 if futures:
                     time.sleep(0.05)
@@ -944,13 +1091,11 @@ class PipelineScheduler:
                 )
             )
         else:
-            if timeout:
-                final_status = StepStatus.TIMEOUT
-            else:
-                final_status = StepStatus.FAILED
-            ctx.failed_nodes.add(node_key)
-
             if step.allow_failure:
+                if timeout:
+                    final_status = StepStatus.TIMEOUT
+                else:
+                    final_status = StepStatus.FAILED
                 final_status = StepStatus.SUCCESS
                 success = True
                 self._log(
@@ -961,6 +1106,12 @@ class PipelineScheduler:
                     step_name=step.name,
                 )
             else:
+                if timeout:
+                    final_status = StepStatus.TIMEOUT
+                else:
+                    final_status = StepStatus.FAILED
+                ctx.failed_nodes.add(node_key)
+
                 self._log(
                     ctx,
                     f"Step '{step.name}' failed: {last_error}",

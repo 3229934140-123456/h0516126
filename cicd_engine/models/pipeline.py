@@ -354,6 +354,11 @@ class DependencyGraph:
                 self._reverse_graph[step_key] = set()
                 self._node_map[step_key] = (stage, step)
 
+                for dep in stage.depends_on:
+                    dep_key = f"stage:{dep}"
+                    self._graph[dep_key].add(step_key)
+                    self._reverse_graph[step_key].add(dep_key)
+
                 for dep in step.depends_on:
                     if ":" in dep:
                         dep_parts = dep.split(":")
